@@ -1,0 +1,25 @@
+name: glossary-trigger
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+    secrets:
+      token:
+        required: true
+
+jobs:
+  trigger-deploy:
+    name: Trigger deploy
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Trigger downstream repositories
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          token: ${{ secrets.token }}
+          repository: ${{ inputs.repository }}
+          event-type: deploy
+          client-payload: '{"ref": "${{ github.ref }}", "sha": "${{ github.sha }}"}'

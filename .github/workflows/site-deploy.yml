@@ -1,0 +1,169 @@
+name: site-deploy
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      concepts-path:
+        required: true
+        type: string
+      breviter-repository:
+        required: false
+        type: string
+      breviter-path:
+        required: false
+        type: string
+      production-branch:
+        required: true
+        type: string
+      staging-branch:
+        required: true
+        type: string
+      production-url:
+        required: true
+        type: string
+      staging-url:
+        required: true
+        type: string
+    secrets:
+      aws-access-key-id:
+        required: true
+      aws-secret-access-key:
+        required: true
+      aws-region:
+        required: true
+      aws-cf-distribution-id:
+        required: true
+      aws-s3-bucket-name:
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      environment-name: ${{ steps.prepare.outputs.environment-name }}
+      environment-url: ${{ steps.prepare.outputs.environment-url }}
+    steps:
+      - name: Setup prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl make libxml2-dev libxslt-dev openssl libcurl4-openssl-dev
+
+      - name: Prepare environment props
+        id: prepare
+        run: |
+          if [ "${{ inputs.ref }}" = "refs/heads/main" ]; then
+            environment_name="production"
+            environment_url="${{ inputs.production-url }}"
+          elif [ "${{ inputs.ref }}" = "refs/heads/staging" ]; then
+            environment_name="staging"
+            environment_url="${{ inputs.staging-url }}"
+          else
+            environment_name=skip
+            environment_url=missing
+          fi
+          
+          echo "environment-url=${environment_url}" >> $GITHUB_OUTPUT
+          echo "environment-name=${environment_name}" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Use Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 2.7
+          bundler-cache: true
+
+      - name: Checkout data
+        uses: actions/checkout@v3
+        with:
+          token: ${{ github.token }}
+          repository: ${{ inputs.repository }}
+          path: ${{ inputs.concepts-path }}
+          ref: ${{ steps.prepare.outputs.environment-name == 'skip' && inputs.production-branch || inputs.ref }}
+          fetch-depth: 1
+
+      - name: Checkout breviter
+        if: inputs.breviter-repository != ''
+        uses: actions/checkout@v3
+        with:
+          token: ${{ github.token }}
+          repository: ${{ inputs.breviter-repository }}
+          path: ${{ inputs.breviter-path }}
+          ref: main
+          fetch-depth: 1
+          submodules: true
+
+      - name: Cache relaton
+        uses: actions/cache@v3
+        with:
+          path: relaton
+          key: ${{ runner.os }}-${{ hashFiles(join(inputs.concepts-path, '/**/*.yaml')) }}
+
+      - name: Use Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: '12'
+          cache: 'npm'
+
+      - run: npm install
+
+      - name: Build site
+        run: make _site
+
+      - name: Compress files
+        run: zip -9 -r site.zip _site
+
+      - uses: actions/upload-artifact@v3
+        if: steps.prepare.outputs.environment-name != 'skip'
+        with:
+          name: site
+          path: site.zip
+
+  deploy:
+    if: needs.build.outputs.environment-name != 'skip'
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: ${{ needs.build.outputs.environment-name }}
+      url: ${{ needs.build.outputs.environment-url }}
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: site
+
+      - name: Display structure of downloaded files
+        run: ls -R
+
+      - name: Decompress files
+        run: unzip site.zip
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.aws-access-key-id }}
+          aws-secret-access-key: ${{ secrets.aws-secret-access-key }}
+          aws-region: ${{ secrets.aws-region }}
+
+      - name: Deploy to ${{ secrets.aws-s3-bucket-name }}
+        env:
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.aws-cf-distribution-id }}
+          S3_BUCKET_NAME: ${{ secrets.aws-s3-bucket-name }}
+        run: |
+          aws configure set default.s3.max_concurrent_requests 100
+          aws configure set default.s3.max_queue_size 10000
+          aws configure set default.s3.use_accelerate_endpoint true
+          aws configure set default.s3.payload_signing_enabled false
+          aws s3 sync _site s3://$S3_BUCKET_NAME --delete --no-progress --exclude "*" --include "*.html" --content-type "text/html; charset=utf-8"
+          aws s3 sync _site s3://$S3_BUCKET_NAME --delete --no-progress --exclude "*" --include "*.json" --content-type "text/json; charset=utf-8"
+          aws s3 sync _site s3://$S3_BUCKET_NAME --delete --no-progress --exclude "*.html,*.json" --include "*"
+          aws configure set preview.cloudfront true
+          aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DISTRIBUTION_ID --paths "/*"
